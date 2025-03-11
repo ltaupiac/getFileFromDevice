@@ -27,7 +27,7 @@ This document explains the process of registering a new application in Azure Act
 
 ![Files.ReadWrite.all](img/tuto3.png)
 - Click **"Add permissions"**.
-- Grant the permissions by clicking **"Grant admin consent"**.
+- Grant the permissions by clicking **"Grant admin consent" ①**.
 ![Grant permissions](img/tuto4.png)
 ![Permissions grantd](img/tuto5.png)
 
