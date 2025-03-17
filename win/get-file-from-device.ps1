@@ -26,7 +26,7 @@ NOTES
 Context:            root
 Version:            2.0.0.0 - Blob storage upload
 Version:            1.0.0.0 - Initial release
-Last Modified:      2025/03/14  21:40:49
+Last Modified:      2025/03/14  21:24:43
 Author              L. Taupiac
 #>
 #
@@ -77,7 +77,7 @@ Set-Variable -Name LOG_REMOTE_ACTION_NAME -Value $LOG_REMOTE_ACTION_NAME -Scope 
 
 $ABSOLUTE_FILE_PATH_REGEX = '^[\/\\]([^\/\\]+[\/\\])*[^\/\\]+$'
 $TOOLS="$env:ProgramData\Nexthink\RemoteActions\bin\"
-$AZCOPY = "$TOOLS\azcopy.exe"
+$AZCOPY_PATH = "$TOOLS\azcopy.exe"
 $AZ_URL = "https://aka.ms/downloadazcopy-v10-windows-32bit"
 
 
@@ -130,7 +130,7 @@ function Test-Proxy {
 
 function Test-Azcopy {
     Write-NxtLog -Message "Ensuring azcopy is installed"
-    if (-not (Test-Path -Path $AZCOPY)) {
+    if (-not (Test-Path -Path $AZCOPY_PATH)) {
 
         # Define the temp file and extraction paths
         $tempZip = Join-Path -Path $env:TEMP -ChildPath "azcopy.zip"
@@ -211,7 +211,7 @@ function upload_file ([hashtable]$output) {
                 "--check-length=false", "--output-type=json", "--skip-version-check", "--from-to=LocalBlob")
  
     try {
-        $result = & $AZCOPY @params | Out-String
+        $result = & $AZCOPY_PATH @params | Out-String
 
         # Parsing result
         $json = Get-AzCopyResult -AzCopyOutput $result
