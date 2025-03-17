@@ -1,55 +1,42 @@
 ﻿<#
 .SYNOPSIS
-Get a file from a device
+Get a file from a device and upload to Azure Blob Storage
 
 .DESCRIPTION
-Allows to recover a file then a device. The file can then be downloaded from the URL returned by the RA 
-It will also be available in the user's onedrive indicated in the RA parameters
-For security reasons, the token must be generated outside the RA and provided in parameter
-when using the RA
-The getToken.sh script allows the generation of token
+Allows to securely retrieve a file from a device and upload it to an Azure Blob Storage container
+using a SAS token with write permissions.
 
 .FUNCTIONALITY
 Data collection
 
 .INPUTS
 ID  Label                               Description
-1   tenantid                            Directorty (Tenant) ID
-2   token                               token got from the tenant with client_id/secret_id
-3   user_upn                            OneDrive UPN owner (email)
+1   sas_upload_token                    SAS Token with write access to the container
+2   storage_account                     Azure storage account name
+3   container                           Azure blob container name
 4   full_file_path                      The complete file path for the recovery target
-5   return_url                          Boolean: True if the RA should return an URL to download the file
 
 .OUTPUTS
 ID  Label                               Type            Description
 1   file_uploaded                       boolean         True if file was found and uploaded
-2   file_url                            string          URL for downloading the file
-
-.FURTHER INFORMATION
-- An application with API Permissions: Files.ReadWrite.All
-- Directorty (Tenant) ID
-- Application (client) ID
-- Secret ID
-- UPN (email) of OneDrive owner
-- "_NexthinkRA_Bucket_" folder will be created at the root of the OneDrive account, 
-and file will be uploaded into this folder.
+2   blob_path_file                      string          Blob path for downloading the file
 
 .NOTES
 NOTES
 Context:            root
+Version:            2.0.0.0 - Blob storage upload
 Version:            1.0.0.0 - Initial release
-Last Modified:      2025/03/10  14:13:31
+Last Modified:      2025/03/14  21:40:49
 Author              L. Taupiac
 #>
 #
 # Input parameters definition
 #
 param(
-    [Parameter(Mandatory = $true)][string]$tenantid,
-    [Parameter(Mandatory = $true)][string]$token,
-    [Parameter(Mandatory = $true)][string]$user_upn,
-    [Parameter(Mandatory = $true)][string]$full_file_path,
-    [Parameter(Mandatory = $true)][string]$return_url
+    [Parameter(Mandatory = $true)][string]$sas_upload_token,
+    [Parameter(Mandatory = $true)][string]$storage_account,
+    [Parameter(Mandatory = $true)][string]$container,
+    [Parameter(Mandatory = $true)][string]$full_file_path
 )
 # End of parameters definition
 
@@ -69,13 +56,13 @@ $ERROR_EXCEPTION_TYPE = @{Environment = '[Environment error]'
     Input = '[Input error]'
     Internal = '[Internal error]'
 }
-Set-Variable -Name 'ERROR_EXCEPTION_TYPE' -Option ReadOnly -Scope Script -Force
+Set-Variable -Name 'ERROR_EXCEPTION_TYPE' -Scope Script -Force
 
 $LOCAL_SYSTEM_IDENTITY = 'S-1-5-18'
-Set-Variable -Name 'LOCAL_SYSTEM_IDENTITY' -Option ReadOnly -Scope Script -Force
+Set-Variable -Name 'LOCAL_SYSTEM_IDENTITY' -Scope Script -Force
 
 $REMOTE_ACTION_DLL_PATH = "$env:NEXTHINK\RemoteActions\nxtremoteactions.dll"
-Set-Variable -Name 'REMOTE_ACTION_DLL_PATH' -Option ReadOnly -Scope Script -Force
+Set-Variable -Name 'REMOTE_ACTION_DLL_PATH' -Scope Script -Force
 
 $WINDOWS_VERSIONS = @{Windows7 = '6.1'
     Windows8 = '6.2'
@@ -83,20 +70,15 @@ $WINDOWS_VERSIONS = @{Windows7 = '6.1'
     Windows10 = '10.0'
     Windows11 = '10.0'
 }
-Set-Variable -Name 'WINDOWS_VERSIONS' -Option ReadOnly -Scope Script -Force
-
+Set-Variable -Name 'WINDOWS_VERSIONS'  -Scope Script -Force
 
 $LOG_REMOTE_ACTION_NAME = "Get-FileFromDevice"
 Set-Variable -Name LOG_REMOTE_ACTION_NAME -Value $LOG_REMOTE_ACTION_NAME -Scope Global -Force
 
-$TENANT_ID_REGEX = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
-$UPN_REGEX = '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
 $ABSOLUTE_FILE_PATH_REGEX = '^[\/\\]([^\/\\]+[\/\\])*[^\/\\]+$'
-$JWT_REGEX = '^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$'
-$BOOLEAN_REGEX = '^(0|1|true|false)$'
-
-$ONEDRIVE_URL = 'https://graph.microsoft.com/v1.0/users/{0}/drive/root:{1}:/content'
-$ONEDRIVE_BUCKET = "/_NexthinkRA_Bucket_"
+$TOOLS="$env:ProgramData\Nexthink\RemoteActions\bin\"
+$AZCOPY = "$TOOLS\azcopy.exe"
+$AZ_URL = "https://aka.ms/downloadazcopy-v10-windows-32bit"
 
 
 #
@@ -110,9 +92,12 @@ function Invoke-Main ([hashtable]$InputParameters) {
 
     try {
         Add-NexthinkRemoteActionDLL
-        Test-RunningAsLocalSystem
+        # Test-RunningAsLocalSystem
         Test-MinimumSupportedOSVersion -WindowsVersion 'Windows10'
         Test-InputParameters -InputParameters $InputParameters
+        Test-Proxy
+        Test-Azcopy
+
         upload_file -output $upload
     } catch {
         Write-StatusMessage -Message $_
@@ -123,6 +108,69 @@ function Invoke-Main ([hashtable]$InputParameters) {
     }
 
     return $exitCode
+}
+
+function Test-Proxy {
+    Write-NxtLog -Message "Checking proxy connectivity"
+
+    if ($env:HTTP_PROXY) {
+        try {
+            $proxyUri = [uri]$env:HTTP_PROXY
+            $tcpClient = New-Object System.Net.Sockets.TcpClient
+            $tcpClient.Connect($proxyUri.Host, $proxyUri.Port)
+            $tcpClient.Close()
+            Write-NxtLog -Message "Proxy $($env:HTTP_PROXY) is reachable"
+        } catch {
+            throw "$($ERROR_EXCEPTION_TYPE.Environment) Proxy $($env:HTTP_PROXY) is not reachable or refused connection"
+        }
+    } else {
+        Write-NxtLog -Message "No HTTP_PROXY variable defined, skipping proxy check"
+    }
+}
+
+function Test-Azcopy {
+    Write-NxtLog -Message "Ensuring azcopy is installed"
+    if (-not (Test-Path -Path $AZCOPY)) {
+
+        # Define the temp file and extraction paths
+        $tempZip = Join-Path -Path $env:TEMP -ChildPath "azcopy.zip"
+        $extractPath = Join-Path -Path $env:TEMP -ChildPath "azcopy_extracted"        
+
+        $webClient = New-Object System.Net.WebClient
+
+        if ($env:HTTP_PROXY) {
+            $webProxy = New-Object System.Net.WebProxy($env:HTTP_PROXY, $true)
+            $webClient.Proxy = $webProxy
+            Write-NxtLog -Message "Using proxy $($env:HTTP_PROXY)"
+        }
+        Write-NxtLog -Message "Downloading AzCopy..."
+        $webClient.DownloadFile($AZ_URL, $tempZip)
+
+        # Extract azcopy
+        Write-NxtLog -Message "Extracting azcopy archive..."
+        Expand-Archive -Path $tempZip -DestinationPath $extractPath -Force
+
+        # Locate azcopy.exe and copy to destination
+        Write-NxtLog -Message "Copying azcopy to destination [$tools]..."
+        $azcopyExe = Get-ChildItem -Path $extractPath -Filter "azcopy.exe" -Recurse | Select-Object -First 1
+
+        if (-not $azcopyExe) {
+            throw "Unable to find azcopy.exe after extraction."
+        }
+
+        # Ensure destination folder exists
+        if (-not (Test-Path -Path $tools)) {
+            New-Item -Path $tools -ItemType Directory | Out-Null
+        }
+
+        Copy-Item -Path $azcopyExe.FullName -Destination $tools -Force
+
+        # Cleanup
+        Remove-Item -Path $tempZip -Force
+        Remove-Item -Path $extractPath -Recurse -Force
+
+        Write-NxtLog -Message "Azcopy installation completed successfully."
+    }
 }
 
 #
@@ -149,56 +197,61 @@ function Initialize-Outputs {
 
 function upload_file ([hashtable]$output) {
     Write-NxtLog -Message "Calling function $($MyInvocation.MyCommand)"
-
-    # Obtient le nom d'hôte de la machine locale
     $machine_name = $env:COMPUTERNAME
-
     if ([string]::IsNullOrEmpty($machine_name)) {
-        throw "$($ERROR_EXCEPTION_TYPE.Environment) Impossible de récupérer le nom de la machine locale."
+        throw "$($ERROR_EXCEPTION_TYPE.Environment) Cannot get hostname"
     }
-
-    # Construit le chemin cible sur OneDrive
     $normalizedFilePath = $full_file_path -replace '[:]', '' -replace '\\', '/'
-    $targetFile = "$ONEDRIVE_BUCKET/$machine_name/$normalizedFilePath"
+    $blob_path_file = "/$machine_name$normalizedFilePath"
+    $output.blob_path_file = $blob_path_file
+    
+    $target = "https://${storage_account}.blob.core.windows.net/${container}${blob_path_file}?${sas_upload_token}"
 
-    # URL finale formatée
-    $url = [string]::Format($ONEDRIVE_URL, $user_upn, $targetFile)
-
-    $headers = @{
-        "Authorization" = "Bearer $token"
-        "Content-Type"  = "application/octet-stream"
-    }
-
-    if (-not (Test-Path -Path $full_file_path -PathType Leaf)) {
-        throw "$($ERROR_EXCEPTION_TYPE.Input) File '$full_file_path' does not exist or is not accessible."
-    }
-
+    $params = @("copy", "`"$full_file_path`"", "`"$target`"", "--overwrite=true", "--output-level=essential",
+                "--check-length=false", "--output-type=json", "--skip-version-check", "--from-to=LocalBlob")
+ 
     try {
-        # Use Invoke-WebRequest to access status code and headers
-        $response = Invoke-WebRequest -Uri $url `
-                                      -Headers $headers `
-                                      -Method Put `
-                                      -InFile $full_file_path `
-                                      -UseBasicParsing `
-                                      -ErrorAction Stop
+        $result = & $AZCOPY @params | Out-String
 
-        # Check the HTTP response status code
-        if ($response.StatusCode -in 200, 201) {
+        # Parsing result
+        $json = Get-AzCopyResult -AzCopyOutput $result
+
+        # Analyse du status
+        if ($json.JobStatus -eq "Completed" -and $json.TotalBytesTransferred -gt 0) {
             $output.file_uploaded = $true
-
-            # Return download URL if requested
-            if ($return_url -match '^(1|true)$') {
-                $jsonResponse = $response.Content | ConvertFrom-Json
-                $output.file_url = $jsonResponse.'@microsoft.graph.downloadUrl'
-            }
         } else {
-            $output.file_uploaded = $false
-            throw "$($ERROR_EXCEPTION_TYPE.Internal) Upload failed with HTTP status $($response.StatusCode)."
+            $reason = $json.FailedTransfers[0].ErrorCode
+            throw "$($ERROR_EXCEPTION_TYPE.Upload) Upload failed: $reason"
+        }
+    } catch {
+        throw "$($ERROR_EXCEPTION_TYPE.Upload) Error in azcopy upload: $_"
+    }
+}
+
+function Get-AzCopyResult {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$AzCopyOutput
+    )
+
+    # Split the raw output into lines (multiple JSON objects possible)
+    $lines = $AzCopyOutput -split "`n"
+
+    foreach ($line in $lines) {
+        try {
+            $json = $line | ConvertFrom-Json -ErrorAction Stop
+
+            if ($json.MessageType -eq 'EndOfJob') {
+                # Second level of parsing: MessageContent is a JSON string → reparse it
+                $innerJson = $json.MessageContent | ConvertFrom-Json -ErrorAction Stop
+                return $innerJson
+            }
+        } catch {
+            continue
         }
     }
-    catch {
-        throw "$($ERROR_EXCEPTION_TYPE.Internal) Error during file upload: $_"
-    }
+
+    throw "[Internal error] Cannot extract EndOfJob result from azcopy output."
 }
 
 function Test-PowerShellVersion ([int]$MinimumVersion) {
@@ -208,7 +261,6 @@ function Test-PowerShellVersion ([int]$MinimumVersion) {
 }
 
 function Get-LogPath {
-
     if (Confirm-CurrentUserIsLocalSystem) {
         return "$env:ProgramData\Nexthink\RemoteActions\Logs\"
     }
@@ -216,13 +268,11 @@ function Get-LogPath {
 }
 
 function Confirm-CurrentUserIsLocalSystem {
-
     $currentIdentity = Get-CurrentIdentity
     return $currentIdentity -eq $LOCAL_SYSTEM_IDENTITY
 }
 
 function Get-CurrentIdentity {
-
     return [security.principal.windowsidentity]::GetCurrent().User.ToString()
 }
 
@@ -249,7 +299,6 @@ function Write-NxtLog ([string]$Message, [object]$Object) {
 }
 
 function Add-NexthinkRemoteActionDLL {
-
     if (-not (Test-Path -Path $REMOTE_ACTION_DLL_PATH)) {
         throw "$($ERROR_EXCEPTION_TYPE.Environment) Nexthink Remote Action DLL not found. "
     }
@@ -257,7 +306,6 @@ function Add-NexthinkRemoteActionDLL {
 }
 
 function Test-RunningAsLocalSystem {
-
     if (-not (Confirm-CurrentUserIsLocalSystem)) {
         throw "$($ERROR_EXCEPTION_TYPE.Environment) This script must be run as LocalSystem. "
     }
@@ -283,7 +331,6 @@ function Test-MinimumSupportedOSVersion ([string]$WindowsVersion, [switch]$Suppo
 }
 
 function Get-OSVersionType {
-
     return Get-WindowsManagementData -Class Win32_OperatingSystem | Select-Object -Property Version,ProductType
 }
 
@@ -313,7 +360,6 @@ function Write-StatusMessage ([psobject]$Message) {
 }
 
 function Get-ScriptVersion {
-
     $scriptContent = Get-Content $MyInvocation.ScriptName | Out-String
     if ($scriptContent -notmatch '<#[\r\n]{2}.SYNOPSIS[^\#\>]*(.NOTES[^\#\>]*)\#>') { return }
 
@@ -337,22 +383,8 @@ function Stop-NxtLogging ([string]$Result) {
     }
 }
 
-function Test-StringNullOrEmpty ([string]$ParamName, [string]$ParamValue) {
-    if ([string]::IsNullOrEmpty((Format-StringValue -Value $ParamValue))) {
-        throw "$($ERROR_EXCEPTION_TYPE.Input) '$ParamName' cannot be empty nor null. "
-    }
-}
-
 function Format-StringValue ([string]$Value) {
     return $Value.Replace('"', '').Replace("'", '').Trim()
-}
-
-function Test-ParamInAllowedRange ([string]$ParamName, [string]$ParamValue, [int]$LowerLimit, [int]$UpperLimit) {
-    Test-ParamIsInteger -ParamName $ParamName -ParamValue $ParamValue
-    $intValue = $ParamValue -as [int]
-    if ($intValue -lt $LowerLimit -or $intValue -gt $UpperLimit) {
-        throw "$($ERROR_EXCEPTION_TYPE.Input) Error in parameter '$ParamName'. It must be between [$LowerLimit, $UpperLimit]. "
-    }
 }
 
 function Test-ParamIsInteger ([string]$ParamName, [string]$ParamValue) {
@@ -362,28 +394,55 @@ function Test-ParamIsInteger ([string]$ParamName, [string]$ParamValue) {
     }
 }
 
-
 #
 # Input parameter validation
 #
-
-function Test-InputParameters ([hashtable]$InputParameters) {
+function Test-InputParameters {
     Write-NxtLog -Message "Calling $($MyInvocation.MyCommand)"
-    if ($tenantid -notmatch $TENANT_ID_REGEX) {
-        throw "$($ERROR_EXCEPTION_TYPE.Input) Invalid Tenant ID format."
+    Test-SASUploadToken $sas_upload_token
+    Test-AbsoluteFilePath $full_file_path
+
+    if ($storage_account -notmatch '^[a-z0-9]{3,24}$') {
+        throw "$($ERROR_EXCEPTION_TYPE.Input) Invalid storage account name: $storage_account"
     }
-    if ($user_upn -notmatch $UPN_REGEX) {
-        throw "$($ERROR_EXCEPTION_TYPE.Input) Invalid UPN (email) format."
+    if ($container -notmatch '^[a-z0-9\-]{3,63}$') {
+        throw "$($ERROR_EXCEPTION_TYPE.Input) Invalid container name: $container"
     }
-    if ($full_file_path -notmatch $ABSOLUTE_FILE_PATH_REGEX) {
-        throw "$($ERROR_EXCEPTION_TYPE.Input) Invalid absolute file path."
+}
+
+function Test-AbsoluteFilePath {
+    param([string]$path)
+    Write-NxtLog -Message "Checking path format"
+
+    if ($path -notmatch $ABSOLUTE_FILE_PATH_REGEX) {
+        throw "$($ERROR_EXCEPTION_TYPE.Input) Invalid file path format: $path"
     }
-    if ($token -notmatch $JWT_REGEX) {
-        throw "$($ERROR_EXCEPTION_TYPE.Input) Invalid JWT token format."
+    if (-not (Test-Path $path -PathType Leaf)) {
+        throw "$($ERROR_EXCEPTION_TYPE.Input) File '$path' not found or unreadable"
     }
-    if ($return_url -notmatch $BOOLEAN_REGEX) {
-        throw "$($ERROR_EXCEPTION_TYPE.Input) return_url must be boolean."
+}
+
+function Test-SASUploadToken {
+    param([string]$token)
+    Write-NxtLog -Message "Checking SAS token"
+
+    if ($token -notmatch "st=" -or $token -notmatch "se=") {
+        throw "$($ERROR_EXCEPTION_TYPE.Input) SAS token missing 'st=' or 'se='."
     }
+
+    $st = ($token -split '&') | Where-Object { $_ -like "st=*" } | ForEach-Object { ($_ -split '=')[1] }
+    $se = ($token -split '&') | Where-Object { $_ -like "se=*" } | ForEach-Object { ($_ -split '=')[1] }
+
+    try {
+        $startDate = [datetime]::Parse($st).ToUniversalTime()
+        $endDate = [datetime]::Parse($se).ToUniversalTime()
+    } catch {
+        throw "$($ERROR_EXCEPTION_TYPE.Input) Invalid date format in SAS token"
+    }
+
+    $now = (Get-Date).ToUniversalTime()
+    if ($now -lt $startDate) { throw "$($ERROR_EXCEPTION_TYPE.Input) SAS token not yet valid." }
+    if ($now -gt $endDate) { throw "$($ERROR_EXCEPTION_TYPE.Input) SAS token expired." }
 }
 
 #
@@ -393,8 +452,7 @@ function Update-EngineOutputVariables ([hashtable]$EventLogEntries) {
     Write-NxtLog -Message "Calling $($MyInvocation.MyCommand)"
 
     [nxt]::WriteOutputBool("file_uploaded", $upload.file_uploaded)
-    [nxt]::WriteOutputString("file_url", $upload.file_url)
-
+    [nxt]::WriteOutputString("blob_path_file", $upload.blob_path_file)
 }
 
 #

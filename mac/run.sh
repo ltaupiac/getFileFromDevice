@@ -10,22 +10,15 @@ source .envrc
 [[ $EUID -ne 0 ]] && echo "Must be root." && exit 1
 
 # Check required var
-for var in clientid secretid tenantid user_upn target_file; 
+for var in sas_upload_token storage_account container target_file; 
     do [[ -z ${(P)var} ]] && echo "❌ $var is not defined." && exit 1
 done
 
 # Set Cache directory
 SCRIPT_DIR="${0:A:h}"
-FULL_FILE_PATH="$SCRIPT_DIR/$target_file"
 FULL_FILE_PATH=$target_file
 
-# gen token to clipboard
-./runGetToken.sh
-
-# get token from clipboad
-token=$(pbpaste)
-
 echo ""
-echo get-file-from-device.sh $tenantid ${token::30} $user_upn $FULL_FILE_PATH 1
+echo get-file-from-device.sh  $FULL_FILE_PATH 
 echo ""
-$SCRIPT_DIR/get-file-from-device.sh $tenantid $token $user_upn $FULL_FILE_PATH 1
+$SCRIPT_DIR/get-file-from-device.sh $sas_upload_token $storage_account $container $FULL_FILE_PATH 1

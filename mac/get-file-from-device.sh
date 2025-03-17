@@ -7,22 +7,29 @@ set -o pipefail  # fail the entire command if any part of the pipe fails
 : << SCRIPT_HEADER
 SYNOPSIS
 Get a file from a device
+
 DESCRIPTION
-Allows to recover a file then a device. The file can then be downloaded from the URL returned by the RA 
-It will also be available in the user's onedrive indicated in the RA parameters
-For security reasons, the token must be generated outside the RA and provided in parameter
-when using the RA
-The getToken.sh script allows the generation of token
+This Remote Action allows secure retreiving of a file from a device and uploads it 
+to an Azure Blob Storage container using a write only SAS token.
+
+The uploaded file will be stored in the following path within the container:
+  /{hostname}/{full_file_path}
+
+The SAS token upload must be generated outside the Remote Action and provided as a parameter. 
+It grants write-only, time-limited access to the target container.
+
+The uploaded file can be download with downloadFromBlob.sh script or from Storage Browser 
+on https://portal.azure.com
+
+This script ensures:
+- Secure upload using `azcopy`
+- Dynamic verification of SAS token validity and expiration
+- Preservation of the original file path and hostname as part of blob path
+- Return of the blob path for download purposes
 
 PREREQUISITES
-- An application with API Permissions: Files.ReadWrite.All
-- Directorty (Tenant) ID
-- Application (client) ID
-- Secret ID
-- UPN (email) of OneDrive owner
-
-- The file will be uploaded to the following user_upn's OneDrive path:
-/_NexthinkRA_Bucket_/{hostname where RA was run}/{full_file_path}
+- Azure Blob storage
+- SAS Upload Token with following permissions: write-only,create blob objects
 
 FUNCTIONALITY
 Data collection
@@ -30,23 +37,23 @@ Data collection
 INPUTS
 Name                                Description
 ------------------------------------------------------------------------------------------------------------------------
-tenantid                            Directorty (Tenant) ID
-token                               token got from the tenant with client_id/secret_id
-user_upn                            OneDrive UPN owner (email)
-full_file_path                      The complete file path for the recovery target
-return_url                          Boolean: True if the RA should return an URL to download the file
+sas_upload_token                    SAS token for uploading
+storage_account                     Azure storage account name
+container                           Azure blob container name
+full_file_path                      Absolute file path for the target file to upload
 
 OUTPUTS
 Name                                Type               Description
 ------------------------------------------------------------------------------------------------------------------------
-file_uploaded                      boolean True if file was found and uploaded
-file_url                            string  URL for downloading the file
+file_uploaded                       boolean True if file was found and uploaded
+blob_path_file                      string  Path of file in container
 
 NOTES
 Context:            root
+Version:            2.0.0.0 - Blob storage usage 
 Version:            1.0.0.1 - Add Hostname and full path for uploaded file
 Version:            1.0.0.0 - Initial release
-Last Modified:      2025/03/10  14:18:21
+Last Modified:      2025/03/14  09:35:54
 Author              L. Taupiac
 SCRIPT_HEADER
 
@@ -96,19 +103,18 @@ fi
 
 # NXT_PARAMETERS_BEGIN
 if [ $# -eq 0 ];then
-    echo "Params required TenantID token userUPN full_file_path file_url"
+    echo "Params required sas_upload_token storage_account container full_file_path"
     exit 1
 fi
-tenantid="$1"
-token="$2"
-user_upn="$3"
+sas_upload_token="$1"
+storage_account="$2"
+container="$3"
 full_file_path="$4"
-return_url="$5"
 # NXT_PARAMETERS_END
 
 # NXT_OUTPUTS_BEGIN
 declare file_uploaded=0
-declare file_url="-"
+declare blob_path_file="-"
 # NXT_OUTPUTS_END
 
 # USER_CONFIGURABLE_CONSTANTS_BEGIN
@@ -128,8 +134,6 @@ readonly ROOT_USER_EUID=0
 readonly INPUT_ERROR='[Input error]'
 readonly ENVIRONMENT_ERROR='[Environment error]'
 readonly UPLOAD_ERROR='[Upload error]'
-readonly TENANT_ID_REGEX='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
-readonly UPN_REGEX='^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
 readonly ABSOLUTE_FILE_PATH_REGEX='^[\/\\]([^\/\\]+[\/\\])*[^\/\\]+$'
 readonly JWT_REGEX='^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$'
 readonly BOOLEAN_REGEX='^(0|1|[Tt][Rr][Uu][Ee]|[Ff][Aa][Ll][Ss][Ee])$'
@@ -138,6 +142,9 @@ readonly PARAM_EMPTY_VALUE='-'
 
 readonly JQ_ARM='https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-macos-arm64'
 readonly JQ_AMD='https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-macos-amd64'
+
+readonly AZCOPY_ARM='https://aka.ms/downloadazcopy-v10-mac-arm64'
+readonly AZCOPY_X86='https://aka.ms/downloadazcopy-v10-mac'
 
 export PATH="$BINPATH:/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bin"
 # CONSTANTS_DEFINITION_END
@@ -153,6 +160,7 @@ function main {
     
     check_proxy
     ensure_jq
+    ensure_azcopy
         
     # Check and filter input parameters
     test_input_parameters
@@ -178,10 +186,10 @@ function ensure_jq {
     # Create BINPATH if needed
     if [[ ! -d "$BINPATH" ]]; then
         mkdir -p "$BINPATH" || { nxt_write_output_error "Can't create folder $BINPATH"; }
+        chmod 755 "$BINPATH" || { nxt_write_output_error "Can't change rights on folder $BINPATH"; }
     fi
 
     local jq_path="$BINPATH/jq"
-
     # Check if jq is already here
     if [[ -x "$jq_path" ]]; then
         return 0
@@ -192,43 +200,69 @@ function ensure_jq {
     arch=$(uname -m)
     local url=""
     case "$arch" in
-        arm64|aarch64)
-            url="$JQ_ARM"
-            ;;
-        x86_64)
-            url="$JQ_AMD"
-            ;;
-        *)
-            exit_with_error "arch '$arch' not supported."
-            ;;
+        arm64|aarch64) url="$JQ_ARM" ;;
+        x86_64)        url="$JQ_AMD" ;;
+        *) exit_with_error "Unsupported arch: $arch" ;;
     esac
 
     # Download jq
-    log  "Download jq from $url..."
-    if ! curl -sSL --proxy1.0 $PROXY "$url" -o "$jq_path"; then
-        nxt_write_output_error "jq download failed" 
-    fi
-    chmod +x "$jq_path" || { nxt_write_output_error "can't make jq executable."; }    
+    log  "Downloading jq from $url..."
+    curl -sSL --proxy1.0 $PROXY "$url" -o "$jq_path" || nxt_write_output_error "jq download failed" 
+    chmod 755 "$jq_path" || nxt_write_output_error "can't make jq executable."
     log "jq installed to $jq_path"
     return 0
 }
 
+function ensure_azcopy {
+    if [[ ! -d "$BINPATH" ]]; then
+        mkdir -p "$BINPATH" || { nxt_write_output_error "Can't create folder $BINPATH"; }
+        chmod 755 "$BINPATH" || { nxt_write_output_error "Can't change rights on folder $BINPATH"; }
+    fi
+
+    if  [[ -x "$BINPATH/azcopy" ]]; then 
+        return 0; 
+    fi
+
+    local arch url zipfile tmpdir
+    arch=$(uname -m)
+    tmpdir=$(mktemp -d)
+    case "$arch" in
+        arm64|aarch64) url="$AZCOPY_ARM" ;;
+        x86_64)        url="$AZCOPY_X86" ;;
+        *) exit_with_error "Unsupported arch: $arch" ;;
+    esac
+
+    log "Downloading azcopy from $url"
+    curl -sSL --proxy1.0 "$PROXY" -o "$tmpdir/azcopy.zip" "$url" || exit_with_error "Azcopy download failed"
+    unzip -q "$tmpdir/azcopy.zip" -d "$tmpdir" || exit_with_error "Unzip failed"
+    local azcopy_bin
+    azcopy_bin=$(find "$tmpdir" -type f -name azcopy -perm +111)
+    if [[ -z "$azcopy_bin" || ! -x "$azcopy_bin" ]]; then
+        exit_with_error "Cannot locate azcopy binary after extraction"
+    fi
+    cp "$azcopy_bin" "$BINPATH/azcopy" || exit_with_error "Cannot install azcopy"
+    chmod 755 "$BINPATH/azcopy" || nxt_write_output_error "can't make az_copy executable."
+    log "azcopy installed to $BINPATH/azcopy"
+}
+
 function test_input_parameters {
     log "start"
-
-    # Log input params
-    log "tenantid=[$tenantid]"
-    log "token=[${token:0:30}...]"
-    log "user_upn=[$user_upn]"
+    log "sas_upload_token=[${sas_upload_token:0:30}...]"
+    log "storage_account=[$storage_account]"
+    log "container=[$container]"
     log "full_file_path=[$full_file_path]"
-    log "return_url=[$return_url]"
 
-    test_tenant_id "$tenantid"
-    validate_jwt_token "$token"
-    test_user_upn "$user_upn"
+    test_sas_upload_token "$sas_upload_token"
+
+    if [[ ! "$storage_account" =~ ^[a-z0-9]{3,24}$ ]]; then
+        exit_with_error "$INPUT_ERROR: Invalid storage account name [$storage_account]"
+    fi
+
+    if [[ ! "$container" =~ ^[a-z0-9\-]{3,63}$ ]]; then
+        exit_with_error "$INPUT_ERROR: Invalid container name [$container]"
+    fi
+
     test_absolute_file_path "$full_file_path"
-    test_return_url "$return_url"
-
     log "end"
 }
 
@@ -326,32 +360,6 @@ function get_current_user_uid {
     echo "$EUID"
 }
 
-# Validate the ID tenant format
-function test_tenant_id() {
-    local tenant_id="$1"
-    log "start"
-
-    if [[ ! "$tenant_id" =~ $TENANT_ID_REGEX ]];then
-       log "$INPUT_ERROR: Invalid tenant ID [$tenant_id]"     
-       exit_with_error "$INPUT_ERROR: Invalid tenant ID [$tenant_id]"     
-    fi
-    log "end"
-    return 0
-}
-
-# Validate upn format (email expected)
-function test_user_upn() {
-    local user_upn="$1"
-    log "start"
-
-    if [[ ! $user_upn =~ $UPN_REGEX ]]; then
-        log "$INPUT_ERROR: Invalid UPN user [$user_upn]"
-        exit_with_error "$INPUT_ERROR: Invalid UPN user [$user_upn]"
-    fi
-    log "end"
-    return 0
-}
-
 # Validate path and file existance
 function test_absolute_file_path() {
     local file_path="$1"
@@ -373,102 +381,86 @@ function test_absolute_file_path() {
     return 0
 }
 
-# JWT Token validation
-function validate_jwt_token() {
+# Validate format and validity of a SAS upload token
+function test_sas_upload_token {
     local token="$1"
     log "start"
 
-    # Global format (3 alphanum sections separated by dot)
-    if [[ ! $token =~ $JWT_REGEX ]]; then
-        log "$INPUT_ERROR: Not valid Token format: [$token]" 
-        exit_with_error "$INPUT_ERROR: Not valid token format [A-Za-z0-9_-]"
+    # Check required SAS token keys
+    for key in se st; do
+        if [[ "$token" != *"$key="* ]]; then
+            exit_with_error "$INPUT_ERROR: SAS token is missing required key '$key='"
+        fi
+    done
+
+    # Extract start and expiry dates
+    local st_param se_param
+    st_param=$(echo "$token" | grep -o 'st=[^&]*' | cut -d= -f2)
+    se_param=$(echo "$token" | grep -o 'se=[^&]*' | cut -d= -f2)
+
+    if [[ -z "$st_param" || -z "$se_param" ]]; then
+        exit_with_error "$INPUT_ERROR: SAS token is missing 'st' or 'se' date."
     fi
 
-    # Reads the 3 sections
-    IFS='.' read -r header payload signature <<< "$token"
+    # Convert to epoch
+    local st_epoch se_epoch now_epoch
+    st_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$st_param" "+%s" 2>/dev/null)
+    se_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$se_param" "+%s" 2>/dev/null)
+    now_epoch=$(date "+%s")
 
-    # Check if there is 3 sections
-    if [[ -z "$header" || -z "$payload" || -z "$signature" ]]; then
-        log "Token section is missing"
-        log "header: [$header]"
-        log "payload: [$payload]"
-        log "signature: [$signature]"
-        exit_with_error "$INPUT_ERROR: The token should have 3 sections xxx.xxx.xxx"
+    if [[ -z "$st_epoch" || -z "$se_epoch" ]]; then
+        exit_with_error "$INPUT_ERROR: Invalid date format in SAS token."
     fi
 
-    # Padd with == to avoid error on the base64
-    header="$header=="
-    payload="$payload=="
-
-    local decoded_header decoded_payload
-    decoded_header=$(echo "$header" | tr '_-' '/+' | base64 --decode 2>/dev/null)
-    decoded_payload=$(echo "$payload" | tr '_-' '/+' | base64 --decode 2>/dev/null)
-
-    # Check JSON
-    if ! echo "$decoded_header" | jq empty >/dev/null 2>&1 ; then
-        exit_with_error "$INPUT_ERROR: Json header invalide [$decoded_header]"
+    if (( now_epoch < st_epoch )); then
+        exit_with_error "$INPUT_ERROR: SAS token is not yet valid (start date in future)."
     fi
-    if ! echo "$decoded_payload" | jq empty >/dev/null 2>&1; then
-        exit_with_error "$INPUT_ERROR: Json payload invalide [$decoded_payload]"
+
+    if (( now_epoch > se_epoch )); then
+        exit_with_error "$INPUT_ERROR: SAS token has expired."
     fi
+
     log "end"
-    return 0
-}
-
-# Boolean check
-function test_return_url() {
-    local value="$1"
-    log "start"
-
-    if [[ ! $value =~ $BOOLEAN_REGEX ]]; then
-        log "$INPUT_ERROR: Boolean expected [$return_url]"
-        exit_with_error "$INPUT_ERROR: Boolean expected [$return_url]"
-    fi
-    log "end"
-    return 0
 }
 
 function upload_file {
     log "start"
+    local machine_name target_blob_url result_file="$DATA_DIR/azcopy_result.json"
 
-    # Get local hostname
-    local machine_name
     machine_name=$(hostname -s)
-    [[ -z "$machine_name" ]] && exit_with_error "$UPLOAD_ERROR" "Can't get localhostname."
+    [[ -z "$machine_name" ]] && exit_with_error "$UPLOAD_ERROR" "Can't get local hostname"
 
-    local targetFile="$ONEDRIVE_BUCKET/$machine_name$full_file_path"
-    local url=${(e)ONEDRIVE_URL}
-    local authent="Authorization: Bearer $token"
-    local header="Content-Type: text/plain"
+    blob_path_file="${machine_name}${full_file_path}"
+    target_blob_url="https://${storage_account}.blob.core.windows.net/${container}/${blob_path_file}?${sas_upload_token}"
 
-    res=$(curl --location -s -o - -w '%{http_code}' -X PUT $url -H "$authent" --header "$header" --data-binary @"$full_file_path")  
+    log "Uploading to: $target_blob_url"
 
-    http_code="${res:(-3)}"  # Get HTTP code
-    json_response="${res:0:(-3)}"  # Get JSON
-
-    error_message=$(echo "$json_response" | jq -r '.error.message // empty')
-    file_uploaded=$([[ "$http_code" == "200" || "$http_code" == "201" ]] && [[ -z "$error_message" ]] && echo 1 || echo 0)
+    azparams=(--overwrite=true --check-length=false --skip-version-check --from-to=LocalBlob)
+    azparams+=(--output-level=essential --log-level=none --output-type json)
     
-    log "http_code=[$http_code]"
-    log "json_response=[$json_response]"
+    res=$("$BINPATH/azcopy" copy "$full_file_path" "$target_blob_url" "${azparams[@]}" ) 2>/dev/null
 
-    if [[ $file_uploaded -eq 0 ]];then 
-        exit_with_error "$UPLOAD_ERROR: $error_message"
+    local job_status
+    job_status=$(echo $res | jq -r 'select(.MessageType == "EndOfJob") | .MessageContent | fromjson | .JobStatus')
+
+    if [[ "$job_status" == "Completed" ]]; then
+        local bytes
+        bytes=$(echo $res | jq -r 'select(.MessageType == "EndOfJob") | .MessageContent | fromjson | .TotalBytesTransferred' )
+        file_uploaded=$([[ "$bytes" -gt 0 ]] && echo 1 || echo 0)
+        log "status=[$job_status], bytes=[$bytes]"
+    else
+        local upload_error_reason
+        upload_error_reason=$(echo $res | jq -r 'select(.MessageType == "EndOfJob") | .MessageContent | fromjson | .FailedTransfers[0].ErrorCode // "unknown-error"')
+        exit_with_error "$UPLOAD_ERROR" "azcopy upload failed: $upload_error_reason"
     fi
-    
-    if [[ $return_url -eq 1 ]]; then
-        file_url=$(echo $json_response | jq -r '."@microsoft.graph.downloadUrl"')
-        log "FileUrl=[$file_url]"
-    fi
-        
+
     log "end"
 }
-# COMMON_FUNCTIONS_END
 
 function update_output_variables {
     log "start"
     nxt_write_output_bool 'file_uploaded' "$file_uploaded"
-    nxt_write_output_string 'file_url' "$file_url"
+    nxt_write_output_string 'blob_path_file' "$blob_path_file"
     log "end"
 }
 
